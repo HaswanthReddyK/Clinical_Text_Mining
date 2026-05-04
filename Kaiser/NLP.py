@@ -126,9 +126,6 @@ class PipelineConfig:
     batch_log_every: int = 100
     worker_threads: int = 1
 
-    # data source
-    force_icd_refresh: bool = False
-
     # checkpointing
     checkpoint_file: str = "pipeline_checkpoint.json"
 
@@ -279,9 +276,8 @@ def fetch_from_databricks(
 # STEP 1 — ICD-10-CM FETCHER
 # =============================================================================
 class ICD10CMFetcher:
-    """Downloads the full ICD-10-CM tabular-order file from CMS and caches it."""
+    """Downloads the full ICD-10-CM tabular-order file from CMS."""
 
-    CACHE_FILE = Path("icd10cm_codes.json")
     CMS_PAGE_URL = "https://www.cms.gov/medicare/coding-billing/icd-10-codes"
 
     _FALLBACK_URLS: List[str] = [
@@ -294,24 +290,15 @@ class ICD10CMFetcher:
     # Skip quarterly / addenda ZIP files — they contain only deltas, not the full list.
     _QUARTERLY_RE = re.compile(r"\b(?:april|january|july|october|addenda|update[d]?)\b", re.IGNORECASE)
 
-    def __init__(self, force_refresh: bool = False) -> None:
-        self.force_refresh = force_refresh
+    def __init__(self) -> None:
         self.codes: Dict[str, str] = {}
 
     def fetch(self) -> Dict[str, str]:
-        if not self.force_refresh and self.CACHE_FILE.exists():
-            log.info(f"ICD-10-CM: loading from cache ({self.CACHE_FILE}) …")
-            self.codes = json.loads(self.CACHE_FILE.read_text(encoding="utf-8"))
-            log.info(f"  {len(self.codes):,} codes loaded.")
-            return self.codes
-
         log.info("ICD-10-CM: fetching from CMS …")
         zip_bytes = self._scrape_cms_page() or self._try_fallbacks()
         if zip_bytes and self._is_zip(zip_bytes):
             self.codes = self._parse_zip(zip_bytes)
-        if self.codes:
-            self._save_cache()
-        else:
+        if not self.codes:
             log.error("Could not retrieve ICD-10-CM codes — ICD mapping disabled.")
         return self.codes
 
@@ -401,9 +388,6 @@ class ICD10CMFetcher:
             log.error(f"  ZIP parse error: {exc}")
         return codes
 
-    def _save_cache(self) -> None:
-        self.CACHE_FILE.write_text(json.dumps(self.codes, ensure_ascii=False), encoding="utf-8")
-        log.info(f"  Cache -> {self.CACHE_FILE}")
 
 # =============================================================================
 # STEP 2 — CLINICAL SPELL CHECKER
@@ -1196,7 +1180,7 @@ class EnhancedTextMiningPipeline:
         log.info("  Enhanced KP Text Mining Pipeline v3 — Initializing")
         log.info("=" * 65)
 
-        icd10_codes = ICD10CMFetcher(force_refresh=self.config.force_icd_refresh).fetch()
+        icd10_codes = ICD10CMFetcher().fetch()
         self.spell_checker    = ClinicalSpellChecker(self.config)
         self.entity_extractor = MedicalEntityExtractor(self.config)
         self.icd10_mapper     = ICD10Mapper(icd10_codes, self.config)
@@ -1466,14 +1450,6 @@ def export_sql_inserts(results: List[Dict], filepath: str = "enhanced_results.sq
     log.info(f"[EXPORT] SQL  -> {filepath}  (append={append})")
 
 
-def export_json(results: List[Dict], filepath: str = "enhanced_results.jsonl", append: bool = False) -> None:
-    """JSONL: one record per line; includes all_entities, stage, egfr_value, temporal for full audit."""
-    mode = "a" if append else "w"
-    with open(filepath, mode, encoding="utf-8") as fh:
-        for record in results:
-            fh.write(json.dumps(record, default=str) + "\n")
-    log.info(f"[EXPORT] JSONL -> {filepath}  ({len(results)} records, append={append})")
-
 
 # =============================================================================
 # STEP 7 — CONSOLE SUMMARY
@@ -1540,8 +1516,6 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--auto-install",          action="store_true",
                    help="Auto-install missing optional packages and restart")
-    p.add_argument("--force-refresh",         action="store_true",
-                   help="Re-download ICD-10-CM codes ignoring cache")
     p.add_argument("--top-n",                 type=int,   default=3)
     p.add_argument("--nlp-batch-size",        type=int,   default=64)
     p.add_argument("--workers",               type=int,   default=1)
@@ -1666,7 +1640,6 @@ if __name__ == "__main__":
         exclude_sections = ["PAST_HISTORY", "SOCIAL_HISTORY"]
 
     config = PipelineConfig(
-        force_icd_refresh  = args.force_refresh,
         icd_top_n          = args.top_n,
         nlp_batch_size     = args.nlp_batch_size,
         worker_threads     = args.workers,
@@ -1690,8 +1663,6 @@ if __name__ == "__main__":
 
     export_csv(results,         filepath=str(out / "enhanced_results.csv"))
     export_sql_inserts(results, filepath=str(out / "enhanced_results.sql"))
-    export_json(results,        filepath=str(out / "enhanced_results.jsonl"))
-
     log.info("All exports complete.")
 
     # =========================================================================
@@ -1737,12 +1708,6 @@ if __name__ == "__main__":
                         filepath=str(out / "enhanced_results.sql"),
                         append=not is_first,
                     )
-                    export_json(
-                        batch_results,
-                        filepath=str(out / "enhanced_results.jsonl"),
-                        append=not is_first,
-                    )
-
                 ckpt.save(batch[-1][ANCHOR_COL], batch_number, total_processed)
 
                 log.info(
